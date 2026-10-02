@@ -1,0 +1,15 @@
+menu "Horloge Wi-Fi"
+
+config APP_WIFI_SSID
+    string "Nom du reseau Wi-Fi"
+    default "MonWifi"
+    help
+        SSID used to connect to the network for time synchronization.
+
+config APP_WIFI_PASSWORD
+    string "Mot de passe Wi-Fi"
+    default ""
+    help
+        Password used to connect to the network for time synchronization.
+
+endmenu
