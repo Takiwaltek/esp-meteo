@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,7 @@ static const char *TAG = "es3n28p";
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAILED_BIT BIT1
 #define WIFI_MAX_RETRIES 10
+#define SATELLITE_REFRESH_MS (30 * 60 * 1000)
 
 typedef enum {
     SCAN_VIEW_WIFI,
@@ -64,8 +66,10 @@ typedef struct {
     int8_t rssi;
 } ble_device_t;
 
+#define FORECAST_DAYS 7
+
 typedef struct {
-    char data[6144];
+    char data[8192];
     size_t length;
     bool overflow;
 } weather_response_t;
@@ -78,13 +82,19 @@ typedef struct {
     bool allocation_failed;
 } satellite_response_t;
 
-static lv_obj_t *s_title_label;
 static lv_obj_t *s_weather_screen;
 static lv_obj_t *s_satellite_screen;
+static lv_obj_t *s_forecast_screen;
+static lv_obj_t *s_fc_day[FORECAST_DAYS];
+static lv_obj_t *s_fc_cond[FORECAST_DAYS];
+static lv_obj_t *s_fc_temp[FORECAST_DAYS];
+static lv_obj_t *s_fc_rain[FORECAST_DAYS];
+static lv_obj_t *s_fc_bar[FORECAST_DAYS];
 static lv_obj_t *s_satellite_image;
 static lv_obj_t *s_satellite_status;
 static lv_obj_t *s_clock_label;
 static lv_obj_t *s_status_label;
+static lv_obj_t *s_wifi_signal_label;
 static lv_obj_t *s_status_dot;
 static lv_obj_t *s_networks_label;
 static lv_obj_t *s_audio_bar;
@@ -151,9 +161,9 @@ static esp_err_t weather_http_event_handler(esp_http_client_event_t *event)
 }
 
 #define SATELLITE_IMAGE_WIDTH 240
-#define SATELLITE_IMAGE_HEIGHT 240
+#define SATELLITE_IMAGE_HEIGHT 320
 #define SATELLITE_DECODE_WIDTH 240
-#define SATELLITE_DECODE_HEIGHT 240
+#define SATELLITE_DECODE_HEIGHT 320
 #define SATELLITE_MAX_RESPONSE_BYTES (128 * 1024)
 
 static esp_err_t satellite_http_event_handler(esp_http_client_event_t *event)
@@ -320,7 +330,14 @@ static bool decode_png8_to_rgb565(const uint8_t *png, size_t length, uint16_t *o
 
 #define SAT_FRAME_COUNT 8
 #define SAT_FRAME_STEP_S (30 * 60)
-#define SAT_BASE_URL "https://view.eumetsat.int/geoserver/ows?service=WMS&version=1.3.0&request=GetMap&layers=msg_fes:ir108,backgrounds:ne_10m_coastline,backgrounds:ne_boundary_lines_land&styles=raster,,&crs=CRS:84&bbox=-12,35,28,61&width=240&height=240&format=image/png8"
+#define MONTPELLIER_LATITUDE_DEG 43.6119
+#define MONTPELLIER_LONGITUDE_DEG 3.8772
+#define SAT_BASE_URL_FORMAT \
+    "https://view.eumetsat.int/geoserver/ows?service=WMS&version=1.3.0" \
+    "&request=GetMap&layers=%s,backgrounds:ne_10m_coastline," \
+    "backgrounds:ne_boundary_lines_land&styles=raster,,&crs=CRS:84" \
+    "&bbox=-12,35,28,61&width=240&height=320&format=image/png8" \
+    "&time=%04d-%02d-%02dT%02d:%02d:00.000Z"
 
 static uint8_t *s_sat_frames[SAT_FRAME_COUNT];
 static lv_image_dsc_t s_sat_dsc[SAT_FRAME_COUNT];
@@ -329,13 +346,17 @@ static int s_sat_count;
 static int s_sat_index;
 static int s_sat_hold;
 static lv_timer_t *s_sat_timer;
+static bool s_satellite_infrared;
+static bool s_satellite_mode_known;
+static bool s_satellite_mode_daylight;
 
 static void satellite_show_frame(int index)
 {
     char text[64];
     struct tm local_time;
     localtime_r(&s_sat_times[index], &local_time);
-    snprintf(text, sizeof(text), "Meteosat IR  %02d:%02d  (%d/%d)",
+    snprintf(text, sizeof(text), "Meteosat %s  %02d:%02d  (%d/%d)",
+             s_satellite_infrared ? "IR108" : "RGB",
              local_time.tm_hour, local_time.tm_min, index + 1, s_sat_count);
     lv_image_set_src(s_satellite_image, &s_sat_dsc[index]);
     lv_label_set_text(s_satellite_status, text);
@@ -356,13 +377,58 @@ static void satellite_animation_cb(lv_timer_t *timer)
     satellite_show_frame(s_sat_index);
 }
 
-static uint8_t *fetch_satellite_frame(time_t frame_time)
+static bool is_daylight_in_montpellier(time_t now)
+{
+    struct tm utc;
+    gmtime_r(&now, &utc);
+    const double pi = 3.14159265358979323846;
+    const double gamma = (2.0 * pi / 365.0) * utc.tm_yday;
+    const double cos_gamma = cos(gamma);
+    const double sin_gamma = sin(gamma);
+    const double cos_2gamma = cos(2.0 * gamma);
+    const double sin_2gamma = sin(2.0 * gamma);
+    const double cos_3gamma = cos(3.0 * gamma);
+    const double sin_3gamma = sin(3.0 * gamma);
+    const double equation_of_time = 229.18 *
+        (0.000075 + 0.001868 * cos_gamma - 0.032077 * sin_gamma
+         - 0.014615 * cos_2gamma - 0.040849 * sin_2gamma);
+    const double solar_declination =
+        0.006918 - 0.399912 * cos_gamma + 0.070257 * sin_gamma
+        - 0.006758 * cos_2gamma + 0.000907 * sin_2gamma
+        - 0.002697 * cos_3gamma + 0.00148 * sin_3gamma;
+    const double latitude = MONTPELLIER_LATITUDE_DEG * pi / 180.0;
+    const double zenith = 90.833 * pi / 180.0;
+    const double cos_hour_angle =
+        cos(zenith) / (cos(latitude) * cos(solar_declination))
+        - tan(latitude) * tan(solar_declination);
+    if (cos_hour_angle <= -1.0 || cos_hour_angle >= 1.0) {
+        ESP_LOGW(TAG, "Sunrise/sunset calculation is out of range");
+        return false;
+    }
+
+    const double hour_angle_deg = acos(cos_hour_angle) * 180.0 / pi;
+    const double solar_noon_minutes = 720.0 - 4.0 * MONTPELLIER_LONGITUDE_DEG
+                                      - equation_of_time;
+    const double sunrise_minutes = solar_noon_minutes - 4.0 * hour_angle_deg;
+    const double sunset_minutes = solar_noon_minutes + 4.0 * hour_angle_deg;
+    const time_t utc_midnight = now - utc.tm_hour * 3600 - utc.tm_min * 60 - utc.tm_sec;
+    const time_t sunrise = utc_midnight + (time_t)(sunrise_minutes * 60.0);
+    const time_t sunset = utc_midnight + (time_t)(sunset_minutes * 60.0);
+    return now >= sunrise && now < sunset;
+}
+
+static uint8_t *fetch_satellite_frame(time_t frame_time, const char *layer)
 {
     struct tm utc;
     gmtime_r(&frame_time, &utc);
     char url[512];
-    snprintf(url, sizeof(url), SAT_BASE_URL "&time=%04d-%02d-%02dT%02d:%02d:00.000Z",
-             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min);
+    int url_length = snprintf(url, sizeof(url), SAT_BASE_URL_FORMAT, layer,
+                              utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                              utc.tm_hour, utc.tm_min);
+    if (url_length < 0 || (size_t)url_length >= sizeof(url)) {
+        ESP_LOGE(TAG, "Satellite URL does not fit in the request buffer");
+        return NULL;
+    }
 
     satellite_response_t response = {0};
     const esp_http_client_config_t config = {
@@ -411,6 +477,8 @@ static void fetch_montpellier_satellite_image(void)
         set_satellite_message("Heure non synchronisee");
         return;
     }
+    const bool daylight = is_daylight_in_montpellier(now);
+    const char *layer = daylight ? "msg_fes:rgb_natural" : "msg_fes:ir108";
 
     uint8_t *frames[SAT_FRAME_COUNT] = {0};
     time_t times[SAT_FRAME_COUNT] = {0};
@@ -421,11 +489,11 @@ static void fetch_montpellier_satellite_image(void)
         snprintf(message, sizeof(message), "Chargement image %d/%d...", i + 1, SAT_FRAME_COUNT);
         set_satellite_message(message);
         time_t frame_time = base - (time_t)i * SAT_FRAME_STEP_S;
-        uint8_t *pixels = fetch_satellite_frame(frame_time);
+        uint8_t *pixels = fetch_satellite_frame(frame_time, layer);
         if (pixels == NULL && i == 0) {
             base -= 900;
             frame_time = base;
-            pixels = fetch_satellite_frame(frame_time);
+            pixels = fetch_satellite_frame(frame_time, layer);
         }
         if (pixels != NULL) {
             frames[count] = pixels;
@@ -449,6 +517,9 @@ static void fetch_montpellier_satellite_image(void)
         return;
     }
     memset(s_sat_frames, 0, sizeof(s_sat_frames));
+    s_satellite_infrared = !daylight;
+    s_satellite_mode_daylight = daylight;
+    s_satellite_mode_known = true;
     for (int i = 0; i < count; ++i) {
         int slot = count - 1 - i;
         s_sat_frames[slot] = frames[i];
@@ -542,6 +613,51 @@ static void icon_moon(lv_obj_t *parent, int x, int y, int diameter)
                LV_RADIUS_CIRCLE, 0x14546A, LV_OPA_COVER);
 }
 
+static void bg_anim_x_cb(void *obj, int32_t value)
+{
+    lv_obj_set_x(obj, value);
+}
+
+static void bg_anim_y_cb(void *obj, int32_t value)
+{
+    lv_obj_set_y(obj, value);
+}
+
+static void create_background_animation(lv_obj_t *parent)
+{
+    static const struct { int16_t y, w; uint16_t ms; } clouds[] = {
+        {70, 70, 26000}, {150, 90, 34000}, {235, 60, 22000},
+    };
+    for (size_t i = 0; i < sizeof(clouds) / sizeof(clouds[0]); ++i) {
+        lv_obj_t *cloud = icon_shape(parent, -clouds[i].w, clouds[i].y, clouds[i].w,
+                                     clouds[i].w / 3, clouds[i].w / 6, 0xFFFFFF, LV_OPA_10);
+        lv_obj_remove_flag(cloud, LV_OBJ_FLAG_CLICKABLE);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, cloud);
+        lv_anim_set_exec_cb(&a, bg_anim_x_cb);
+        lv_anim_set_values(&a, -clouds[i].w, LCD_H_RES);
+        lv_anim_set_duration(&a, clouds[i].ms);
+        lv_anim_set_delay(&a, (uint32_t)i * 4000);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_start(&a);
+    }
+    for (int i = 0; i < 6; ++i) {
+        lv_obj_t *dot = icon_shape(parent, 20 + i * 38, 0, 4, 4, LV_RADIUS_CIRCLE,
+                                   0x9CE3E0, LV_OPA_30);
+        lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, dot);
+        lv_anim_set_exec_cb(&a, bg_anim_y_cb);
+        lv_anim_set_values(&a, LCD_V_RES, -6);
+        lv_anim_set_duration(&a, 9000 + i * 1700);
+        lv_anim_set_delay(&a, (uint32_t)i * 1500);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_start(&a);
+    }
+}
+
 static void set_weather_icon(int code, bool is_day)
 {
     if (s_weather_icon == NULL) {
@@ -601,6 +717,54 @@ static void set_rain_banner(int level, const char *text)
     lv_label_set_text(s_rain_label, text);
 }
 
+static const char *short_condition(int code)
+{
+    if (code == 0) return "Soleil";
+    if (code == 1) return "Peu nuageux";
+    if (code == 2) return "Nuageux";
+    if (code == 3) return "Couvert";
+    if (code == 45 || code == 48) return "Brouillard";
+    if ((code >= 51 && code <= 57)) return "Bruine";
+    if ((code >= 61 && code <= 67) || (code >= 80 && code <= 82)) return "Pluie";
+    if ((code >= 71 && code <= 77) || code == 85 || code == 86) return "Neige";
+    if (code >= 95) return "Orage";
+    return "Variable";
+}
+
+static uint32_t condition_color(int code)
+{
+    if (code == 0 || code == 1) return 0xFFD54A;
+    if (code == 2 || code == 3 || code == 45 || code == 48) return 0xC9D3DA;
+    if (code >= 95) return 0xFF8A6B;
+    if (code >= 71 && code <= 86 && code != 80 && code != 81 && code != 82) return 0xFFFFFF;
+    return 0x6EC6FF;
+}
+
+static void set_forecast_row(int i, const char *date, int code, double tmin, double tmax, int rain)
+{
+    static const char *const names[] = {"Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"};
+    int y = 0, m = 0, d = 0;
+    char buf[32];
+    if (sscanf(date, "%d-%d-%d", &y, &m, &d) == 3) {
+        struct tm t = {.tm_year = y - 1900, .tm_mon = m - 1, .tm_mday = d, .tm_hour = 12};
+        mktime(&t);
+        snprintf(buf, sizeof(buf), "%s %02d", i == 0 ? "Auj." : names[t.tm_wday], d);
+    } else {
+        snprintf(buf, sizeof(buf), "J+%d", i);
+    }
+    lv_label_set_text(s_fc_day[i], buf);
+    lv_label_set_text(s_fc_cond[i], short_condition(code));
+    lv_obj_set_style_text_color(s_fc_cond[i], lv_color_hex(condition_color(code)), LV_PART_MAIN);
+    snprintf(buf, sizeof(buf), "%.0f° / %.0f°", tmin, tmax);
+    lv_label_set_text(s_fc_temp[i], buf);
+    snprintf(buf, sizeof(buf), "%d%%", rain);
+    lv_label_set_text(s_fc_rain[i], buf);
+    uint32_t color = rain >= 60 ? 0xFF6B5B : (rain >= 30 ? 0xFFB347 : 0x7FE0A8);
+    lv_obj_set_style_text_color(s_fc_rain[i], lv_color_hex(color), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_fc_bar[i], lv_color_hex(color), LV_PART_INDICATOR);
+    lv_bar_set_value(s_fc_bar[i], rain, LV_ANIM_OFF);
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
@@ -641,6 +805,21 @@ static void clock_task(void *arg)
                                                  "juil.", "aout", "sept.", "oct.", "nov.", "dec."};
             snprintf(date_text, sizeof(date_text), "%s %d %s", days[local_time.tm_wday],
                      local_time.tm_mday, months[local_time.tm_mon]);
+        }
+
+        char wifi_text[96] = "";
+        if (s_wifi_connected) {
+            wifi_ap_record_t ap = {0};
+            if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+                const char *quality = ap.rssi >= -60 ? "Fort" : (ap.rssi >= -70 ? "Moyen" : "Faible");
+                const char *color = ap.rssi >= -60 ? "7FE0A8" : (ap.rssi >= -70 ? "FFD27A" : "FF6B5B");
+                snprintf(wifi_text, sizeof(wifi_text), "#%s %s %d dBm#\n%.32s", color, quality,
+                         ap.rssi, (const char *)ap.ssid);
+            }
+        }
+        if (s_wifi_signal_label != NULL && esp_lv_adapter_lock(-1) == ESP_OK) {
+            lv_label_set_text(s_wifi_signal_label, wifi_text);
+            esp_lv_adapter_unlock();
         }
 
         char combined[64];
@@ -1014,20 +1193,28 @@ static void boot_button_task(void *arg)
                     lv_screen_load(s_weather_screen);
                     esp_lv_adapter_unlock();
                 }
-            } else {
-                if (!s_satellite_view) {
+            } else if (!s_satellite_view && esp_lv_adapter_lock(-1) == ESP_OK) {
+                bool on_forecast = lv_screen_active() == s_forecast_screen;
+                if (on_forecast) {
                     s_satellite_view = true;
-                    if (esp_lv_adapter_lock(-1) == ESP_OK) {
-                        lv_screen_load(s_satellite_screen);
-                        esp_lv_adapter_unlock();
-                    }
+                    lv_screen_load(s_satellite_screen);
+                } else if (lv_screen_active() == s_weather_screen) {
+                    lv_screen_load(s_forecast_screen);
                 }
-                s_satellite_refresh_requested = true;
-                set_satellite_message(s_wifi_connected
-                                          ? "Chargement de la derniere image..."
-                                          : "En attente du Wi-Fi...");
-            }
-            button_was_pressed = false;
+                esp_lv_adapter_unlock();
+                if (on_forecast) {
+                    s_satellite_refresh_requested = true;
+                    set_satellite_message(s_wifi_connected
+                                              ? "Chargement de la derniere image..."
+                                              : "En attente du Wi-Fi...");
+                }
+            } else if (s_satellite_view) {
+                if (esp_lv_adapter_lock(-1) == ESP_OK) {
+                    lv_screen_load(s_weather_screen);
+                    esp_lv_adapter_unlock();
+                }
+                s_satellite_view = false;
+            }            button_was_pressed = false;
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -1052,7 +1239,7 @@ static void fetch_montpellier_weather(void)
     static weather_response_t response;
     memset(&response, 0, sizeof(response));
     const esp_http_client_config_t config = {
-        .url = "https://api.open-meteo.com/v1/forecast?latitude=43.6108&longitude=3.8767&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,uv_index,is_day&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max&minutely_15=precipitation&forecast_minutely_15=48&timezone=Europe%2FParis",
+        .url = "https://api.open-meteo.com/v1/forecast?latitude=43.6108&longitude=3.8767&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,uv_index,is_day,precipitation&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max&forecast_days=7&hourly=precipitation,precipitation_probability&forecast_hours=24&timezone=Europe%2FParis",
         .event_handler = weather_http_event_handler,
         .user_data = &response,
         .timeout_ms = 10000,
@@ -1068,18 +1255,21 @@ static void fetch_montpellier_weather(void)
     char temperature_text[24] = "--°C";
     char condition_text[48] = "Meteo indisponible";
     char details_text[320] = "Verifie la connexion Wi-Fi";
-    char rain_text[48] = "Prevision de pluie indisponible";
+    char rain_text[64] = "Pluie: prevision indisponible";
     int rain_level = 0;
     int icon_code = -1;
     bool icon_is_day = true;
     if (err != ESP_OK || status_code != 200 || response.overflow) {
         ESP_LOGW(TAG, "Recuperation meteo echouee: %s, HTTP %d%s",
                  esp_err_to_name(err), status_code, response.overflow ? ", reponse trop longue" : "");
+        rain_level = 1;
+        snprintf(rain_text, sizeof(rain_text), "PLUIE 24H: INCONNU - meteo indisponible");
     } else {
         jparse_ctx_t json_context = {0};
         double temperature = 0.0;
         double apparent = 0.0;
         double humidity = 0.0;
+        double current_precipitation = 0.0;
         double wind_speed = 0.0;
         double uv_index = 0.0;
         double temperature_max = 0.0;
@@ -1088,8 +1278,16 @@ static void fetch_montpellier_weather(void)
         double uv_index_max = 0.0;
         int code = -1;
         int is_day = 1;
-        double rain_slots[48] = {0};
+        double rain_slots[24] = {0};
         int rain_slot_count = 0;
+        int rain_probability_count = 0;
+        double rain_probability_slots[24] = {0};
+        char fc_date[FORECAST_DAYS][12] = {{0}};
+        int fc_code[FORECAST_DAYS] = {0};
+        double fc_tmin[FORECAST_DAYS] = {0};
+        double fc_tmax[FORECAST_DAYS] = {0};
+        int fc_rain[FORECAST_DAYS] = {0};
+        int fc_count = 0;
         bool values_valid = false;
         if (json_parse_start(&json_context, response.data, (int)response.length) == OS_SUCCESS) {
             if (json_obj_get_object(&json_context, "current") == OS_SUCCESS) {
@@ -1097,6 +1295,7 @@ static void fetch_montpellier_weather(void)
                     json_obj_get_double(&json_context, "temperature_2m", &temperature) == OS_SUCCESS &&
                     json_obj_get_double(&json_context, "apparent_temperature", &apparent) == OS_SUCCESS &&
                     json_obj_get_double(&json_context, "relative_humidity_2m", &humidity) == OS_SUCCESS &&
+                    json_obj_get_double(&json_context, "precipitation", &current_precipitation) == OS_SUCCESS &&
                     json_obj_get_double(&json_context, "wind_speed_10m", &wind_speed) == OS_SUCCESS &&
                     json_obj_get_double(&json_context, "uv_index", &uv_index) == OS_SUCCESS &&
                     json_obj_get_int(&json_context, "weather_code", &code) == OS_SUCCESS;
@@ -1110,17 +1309,61 @@ static void fetch_montpellier_weather(void)
                     json_get_first_array_double(&json_context, "precipitation_probability_max",
                                                 &precipitation_probability) &&
                     json_get_first_array_double(&json_context, "uv_index_max", &uv_index_max);
+                int n = 0;
+                if (json_obj_get_array(&json_context, "time", &n) == OS_SUCCESS) {
+                    for (int i = 0; i < n && i < FORECAST_DAYS; ++i) {
+                        json_arr_get_string(&json_context, i, fc_date[i], sizeof(fc_date[i]));
+                    }
+                    fc_count = n < FORECAST_DAYS ? n : FORECAST_DAYS;
+                    json_obj_leave_array(&json_context);
+                }
+                if (json_obj_get_array(&json_context, "weather_code", &n) == OS_SUCCESS) {
+                    for (int i = 0; i < n && i < FORECAST_DAYS; ++i) {
+                        json_arr_get_int(&json_context, i, &fc_code[i]);
+                    }
+                    json_obj_leave_array(&json_context);
+                }
+                if (json_obj_get_array(&json_context, "temperature_2m_min", &n) == OS_SUCCESS) {
+                    for (int i = 0; i < n && i < FORECAST_DAYS; ++i) {
+                        json_arr_get_double(&json_context, i, &fc_tmin[i]);
+                    }
+                    json_obj_leave_array(&json_context);
+                }
+                if (json_obj_get_array(&json_context, "temperature_2m_max", &n) == OS_SUCCESS) {
+                    for (int i = 0; i < n && i < FORECAST_DAYS; ++i) {
+                        json_arr_get_double(&json_context, i, &fc_tmax[i]);
+                    }
+                    json_obj_leave_array(&json_context);
+                }
+                if (json_obj_get_array(&json_context, "precipitation_probability_max", &n) == OS_SUCCESS) {
+                    for (int i = 0; i < n && i < FORECAST_DAYS; ++i) {
+                        double p = 0;
+                        json_arr_get_double(&json_context, i, &p);
+                        fc_rain[i] = (int)(p + 0.5);
+                    }
+                    json_obj_leave_array(&json_context);
+                }
                 json_obj_leave_object(&json_context);
             } else {
                 values_valid = false;
             }
             int slot_total = 0;
-            if (values_valid && json_obj_get_object(&json_context, "minutely_15") == OS_SUCCESS) {
+            if (values_valid && json_obj_get_object(&json_context, "hourly") == OS_SUCCESS) {
                 if (json_obj_get_array(&json_context, "precipitation", &slot_total) == OS_SUCCESS) {
-                    for (int i = 0; i < slot_total && i < 48; ++i) {
+                    for (int i = 0; i < slot_total && i < 24; ++i) {
                         double amount = 0.0;
                         json_arr_get_double(&json_context, i, &amount);
                         rain_slots[rain_slot_count++] = amount;
+                    }
+                    json_obj_leave_array(&json_context);
+                }
+                if (json_obj_get_array(&json_context, "precipitation_probability",
+                                       &slot_total) == OS_SUCCESS) {
+                    for (int i = 0; i < slot_total && i < 24; ++i) {
+                        double probability = 0.0;
+                        if (json_arr_get_double(&json_context, i, &probability) == OS_SUCCESS) {
+                            rain_probability_slots[rain_probability_count++] = probability;
+                        }
                     }
                     json_obj_leave_array(&json_context);
                 }
@@ -1161,21 +1404,48 @@ static void fetch_montpellier_weather(void)
                     first_rain = i;
                 }
             }
-            bool raining_now = (code >= 51 && code <= 67) || (code >= 80 && code <= 82) ||
-                               (code >= 95 && code <= 99);
-            if (raining_now || first_rain == 0) {
+            int max_rain_probability = 0;
+            int max_rain_probability_slot = 0;
+            for (int i = 0; i < rain_probability_count; ++i) {
+                int probability = (int)(rain_probability_slots[i] + 0.5);
+                if (probability > max_rain_probability) {
+                    max_rain_probability = probability;
+                    max_rain_probability_slot = i;
+                }
+            }
+            if (current_precipitation >= 0.1) {
                 rain_level = 2;
-                snprintf(rain_text, sizeof(rain_text), "Il pleut en ce moment");
+                snprintf(rain_text, sizeof(rain_text), "PLUIE 24H: OUI - en cours");
             } else if (first_rain > 0) {
+                rain_level = 2;
+                snprintf(rain_text, sizeof(rain_text), "PLUIE 24H: OUI - vers +%dh (%.1f mm)",
+                         first_rain, rain_total);
+            } else if (max_rain_probability >= 50) {
+                rain_level = 2;
+                snprintf(rain_text, sizeof(rain_text), "PLUIE 24H: RISQUE %d%% vers +%dh",
+                         max_rain_probability, max_rain_probability_slot);
+            } else if (max_rain_probability >= 30) {
                 rain_level = 1;
-                snprintf(rain_text, sizeof(rain_text), "Pluie dans %dh%02d (%.1f mm)",
-                         first_rain / 4, (first_rain % 4) * 15, rain_total);
-            } else if (rain_slot_count > 0) {
-                snprintf(rain_text, sizeof(rain_text), "Pas de pluie (12 h)");
+                snprintf(rain_text, sizeof(rain_text), "PLUIE 24H: RISQUE FAIBLE %d%%",
+                         max_rain_probability);
+            } else {
+                rain_level = 0;
+                snprintf(rain_text, sizeof(rain_text), "PLUIE 24H: NON - pas de risque");
+            }
+            ESP_LOGI(TAG, "Rain 24h: current %.1f mm, total %.1f mm, first wet hour %d, max probability %d%%",
+                     current_precipitation, rain_total, first_rain, max_rain_probability);
+
+            if (fc_count > 0 && esp_lv_adapter_lock(-1) == ESP_OK) {
+                for (int i = 0; i < fc_count; ++i) {
+                    set_forecast_row(i, fc_date[i], fc_code[i], fc_tmin[i], fc_tmax[i], fc_rain[i]);
+                }
+                esp_lv_adapter_unlock();
             }
         } else {
             snprintf(condition_text, sizeof(condition_text), "Donnees meteo invalides");
             snprintf(details_text, sizeof(details_text), "Nouvel essai dans 10 min");
+            rain_level = 1;
+            snprintf(rain_text, sizeof(rain_text), "PLUIE 24H: INCONNU - meteo indisponible");
             ESP_LOGW(TAG, "La reponse meteo ne contient pas les donnees attendues");
         }
     }
@@ -1274,10 +1544,24 @@ static void wifi_scan_task(void *arg)
     }
 
     TickType_t last_weather_update = xTaskGetTickCount();
+    TickType_t last_satellite_update = 0;
     while (true) {
-        if (s_satellite_refresh_requested) {
+        time_t current_time;
+        time(&current_time);
+        bool daylight = current_time >= 1700000000 &&
+                        is_daylight_in_montpellier(current_time);
+        TickType_t now_ticks = xTaskGetTickCount();
+        bool satellite_mode_changed =
+            s_satellite_mode_known && daylight != s_satellite_mode_daylight;
+        bool satellite_refresh_due =
+            s_satellite_view && s_satellite_mode_known &&
+            (now_ticks - last_satellite_update) >= pdMS_TO_TICKS(SATELLITE_REFRESH_MS);
+        if (s_satellite_refresh_requested ||
+            (s_satellite_view && s_wifi_connected &&
+             (satellite_mode_changed || satellite_refresh_due))) {
             s_satellite_refresh_requested = false;
             fetch_montpellier_satellite_image();
+            last_satellite_update = xTaskGetTickCount();
         }
         if (wifi_credentials_configured() &&
             (xTaskGetTickCount() - last_weather_update) >= pdMS_TO_TICKS(5 * 60 * 1000)) {
@@ -1383,23 +1667,21 @@ void app_main(void)
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x09212B), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
 
-    s_title_label = lv_label_create(screen);
-    lv_label_set_text(s_title_label, "MONTPELLIER");
-    lv_obj_align(s_title_label, LV_ALIGN_TOP_LEFT, 16, 16);
-    lv_obj_set_style_text_color(s_title_label, lv_color_hex(0x77D8D2), LV_PART_MAIN);
-    lv_obj_set_style_text_font(s_title_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    create_background_animation(screen);
+    lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_scroll_dir(screen, LV_DIR_NONE);
+
+    s_date_label = lv_label_create(screen);
+    lv_label_set_text(s_date_label, "");
+    lv_obj_align(s_date_label, LV_ALIGN_TOP_LEFT, 16, 16);
+    lv_obj_set_style_text_color(s_date_label, lv_color_hex(0x77D8D2), LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_date_label, &lv_font_montserrat_14, LV_PART_MAIN);
 
     s_clock_label = lv_label_create(screen);
     lv_label_set_text(s_clock_label, "--:--");
     lv_obj_align(s_clock_label, LV_ALIGN_TOP_RIGHT, -16, 16);
     lv_obj_set_style_text_color(s_clock_label, lv_color_hex(0xF4F0E8), LV_PART_MAIN);
     lv_obj_set_style_text_font(s_clock_label, &lv_font_montserrat_14, LV_PART_MAIN);
-
-    s_date_label = lv_label_create(screen);
-    lv_label_set_text(s_date_label, "");
-    lv_obj_align(s_date_label, LV_ALIGN_TOP_RIGHT, -16, 34);
-    lv_obj_set_style_text_color(s_date_label, lv_color_hex(0xA9C1C8), LV_PART_MAIN);
-    lv_obj_set_style_text_font(s_date_label, &lv_font_montserrat_10, LV_PART_MAIN);
 
     s_status_dot = lv_obj_create(screen);
     lv_obj_set_size(s_status_dot, 8, 8);
@@ -1413,17 +1695,26 @@ void app_main(void)
     s_status_label = lv_label_create(screen);
     lv_label_set_text(s_status_label, "Connexion au Wi-Fi...");
     lv_obj_align(s_status_label, LV_ALIGN_TOP_LEFT, 32, 50);
-    lv_obj_set_width(s_status_label, LCD_H_RES - 48);
+    lv_obj_set_width(s_status_label, 120);
+    lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xA9C1C8), LV_PART_MAIN);
     lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_10, LV_PART_MAIN);
+
+    s_wifi_signal_label = lv_label_create(screen);
+    lv_label_set_text(s_wifi_signal_label, "");
+    lv_label_set_recolor(s_wifi_signal_label, true);
+    lv_obj_set_width(s_wifi_signal_label, 96);
+    lv_label_set_long_mode(s_wifi_signal_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(s_wifi_signal_label, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_wifi_signal_label, lv_color_hex(0x8FA6AD), LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_wifi_signal_label, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_align(s_wifi_signal_label, LV_ALIGN_TOP_RIGHT, -12, 44);
 
     lv_obj_t *results_panel = lv_obj_create(screen);
     lv_obj_set_size(results_panel, LCD_H_RES - 24, 206);
     lv_obj_align(results_panel, LV_ALIGN_TOP_LEFT, 12, 78);
-    lv_obj_set_style_bg_color(results_panel, lv_color_hex(0x14546A), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(results_panel, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(results_panel, lv_color_hex(0x28778A), LV_PART_MAIN);
-    lv_obj_set_style_border_width(results_panel, 1, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(results_panel, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(results_panel, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(results_panel, 20, LV_PART_MAIN);
     lv_obj_set_style_pad_all(results_panel, 8, LV_PART_MAIN);
     lv_obj_set_scroll_dir(results_panel, LV_DIR_NONE);
@@ -1465,7 +1756,7 @@ void app_main(void)
     lv_obj_set_style_text_line_space(s_networks_label, 8, LV_PART_MAIN);
 
     s_rain_banner = lv_obj_create(screen);
-    lv_obj_set_size(s_rain_banner, LCD_H_RES - 24, 24);
+    lv_obj_set_size(s_rain_banner, LCD_H_RES - 24, 28);
     lv_obj_align(s_rain_banner, LV_ALIGN_TOP_LEFT, 12, 290);
     lv_obj_set_style_bg_color(s_rain_banner, lv_color_hex(0x1F6F54), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_rain_banner, LV_OPA_COVER, LV_PART_MAIN);
@@ -1477,7 +1768,7 @@ void app_main(void)
     lv_label_set_text(s_rain_label, "Prevision de pluie...");
     lv_obj_center(s_rain_label);
     lv_obj_set_style_text_color(s_rain_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-    lv_obj_set_style_text_font(s_rain_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_rain_label, &lv_font_montserrat_10, LV_PART_MAIN);
 
     esp_lv_adapter_unlock();
 
@@ -1487,16 +1778,21 @@ void app_main(void)
     lv_obj_set_style_bg_color(s_satellite_screen, lv_color_hex(0x071820), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_satellite_screen, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_scroll_dir(s_satellite_screen, LV_DIR_NONE);
+    lv_obj_set_scrollbar_mode(s_satellite_screen, LV_SCROLLBAR_MODE_OFF);
+
+    s_satellite_image = lv_image_create(s_satellite_screen);
+    lv_obj_set_size(s_satellite_image, SATELLITE_IMAGE_WIDTH, SATELLITE_IMAGE_HEIGHT);
+    lv_obj_align(s_satellite_image, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_t *satellite_title = lv_label_create(s_satellite_screen);
     lv_label_set_text(satellite_title, "SATELLITE METEOSAT");
     lv_obj_align(satellite_title, LV_ALIGN_TOP_MID, 0, 8);
     lv_obj_set_style_text_color(satellite_title, lv_color_hex(0x9CE3E0), LV_PART_MAIN);
     lv_obj_set_style_text_font(satellite_title, &lv_font_montserrat_14, LV_PART_MAIN);
-
-    s_satellite_image = lv_image_create(s_satellite_screen);
-    lv_obj_set_size(s_satellite_image, 240, 240);
-    lv_obj_align(s_satellite_image, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(satellite_title, lv_color_hex(0x071820), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(satellite_title, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(satellite_title, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(satellite_title, 4, LV_PART_MAIN);
 
     s_satellite_status = lv_label_create(s_satellite_screen);
     lv_label_set_text(s_satellite_status, "Appui court BOOT pour charger");
@@ -1505,19 +1801,82 @@ void app_main(void)
     lv_obj_set_style_text_color(s_satellite_status, lv_color_hex(0xD5E0DF), LV_PART_MAIN);
     lv_obj_set_style_text_font(s_satellite_status, &lv_font_montserrat_10, LV_PART_MAIN);
     lv_obj_align(s_satellite_status, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_set_style_bg_color(s_satellite_status, lv_color_hex(0x071820), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_satellite_status, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_satellite_status, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_satellite_status, 4, LV_PART_MAIN);
 
     lv_obj_t *satellite_hint = lv_label_create(s_satellite_screen);
-    lv_label_set_text(satellite_hint, "BOOT: actualiser  |  appui long: retour");
+    lv_label_set_text(satellite_hint, "BOOT: suivant  |  appui long: accueil");
     lv_obj_set_width(satellite_hint, LCD_H_RES - 8);
     lv_obj_set_style_text_align(satellite_hint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(satellite_hint, lv_color_hex(0x789096), LV_PART_MAIN);
     lv_obj_set_style_text_font(satellite_hint, &lv_font_montserrat_10, LV_PART_MAIN);
     lv_obj_align(satellite_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(satellite_hint, lv_color_hex(0x071820), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(satellite_hint, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(satellite_hint, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(satellite_hint, 4, LV_PART_MAIN);
     esp_lv_adapter_unlock();
 
+    ESP_ERROR_CHECK(esp_lv_adapter_lock(-1));
+    s_forecast_screen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_forecast_screen, lv_color_hex(0x0B1620), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_forecast_screen, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_forecast_screen, 0, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(s_forecast_screen, LV_DIR_NONE);
+    create_background_animation(s_forecast_screen);
+    lv_obj_set_scrollbar_mode(s_forecast_screen, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_t *fc_title = lv_label_create(s_forecast_screen);
+    lv_label_set_text(fc_title, "PREVISIONS 7 JOURS");
+    lv_obj_set_style_text_color(fc_title, lv_color_hex(0x9CE3E0), LV_PART_MAIN);
+    lv_obj_set_style_text_font(fc_title, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_align(fc_title, LV_ALIGN_TOP_MID, 0, 6);
+    for (int i = 0; i < FORECAST_DAYS; ++i) {
+        lv_obj_t *row = lv_obj_create(s_forecast_screen);
+        lv_obj_set_size(row, LCD_H_RES - 12, 38);
+        lv_obj_set_pos(row, 6, 28 + i * 41);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+        lv_obj_set_style_border_color(row, lv_color_hex(0x2F5568), LV_PART_MAIN);
+        lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+        lv_obj_set_style_radius(row, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
+        lv_obj_set_scroll_dir(row, LV_DIR_NONE);
+
+        s_fc_day[i] = lv_label_create(row);
+        lv_label_set_text(s_fc_day[i], "--");
+        lv_obj_set_pos(s_fc_day[i], 8, 4);
+        lv_obj_set_style_text_color(s_fc_day[i], lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+        lv_obj_set_style_text_font(s_fc_day[i], &lv_font_montserrat_14, LV_PART_MAIN);
+
+        s_fc_cond[i] = lv_label_create(row);
+        lv_label_set_text(s_fc_cond[i], "");
+        lv_obj_set_pos(s_fc_cond[i], 8, 23);
+        lv_obj_set_style_text_font(s_fc_cond[i], &lv_font_montserrat_10, LV_PART_MAIN);
+
+        s_fc_temp[i] = lv_label_create(row);
+        lv_label_set_text(s_fc_temp[i], "-- / --");
+        lv_obj_set_pos(s_fc_temp[i], 78, 10);
+        lv_obj_set_style_text_color(s_fc_temp[i], lv_color_hex(0xFFD27A), LV_PART_MAIN);
+        lv_obj_set_style_text_font(s_fc_temp[i], &lv_font_montserrat_14, LV_PART_MAIN);
+
+        s_fc_rain[i] = lv_label_create(row);
+        lv_label_set_text(s_fc_rain[i], "--%");
+        lv_obj_set_pos(s_fc_rain[i], 168, 4);
+        lv_obj_set_style_text_font(s_fc_rain[i], &lv_font_montserrat_14, LV_PART_MAIN);
+
+        s_fc_bar[i] = lv_bar_create(row);
+        lv_obj_set_size(s_fc_bar[i], 56, 6);
+        lv_obj_set_pos(s_fc_bar[i], 160, 25);
+        lv_bar_set_range(s_fc_bar[i], 0, 100);
+        lv_obj_set_style_bg_color(s_fc_bar[i], lv_color_hex(0x2A4256), LV_PART_MAIN);
+        lv_obj_set_style_pad_all(s_fc_bar[i], 0, LV_PART_MAIN);
+    }
+    esp_lv_adapter_unlock();
     BaseType_t task_created = xTaskCreate(wifi_scan_task, "wifi_scan", 16384, NULL, 5, NULL);
     ESP_ERROR_CHECK(task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
-    task_created = xTaskCreate(clock_task, "clock", 3072, NULL, 4, NULL);
+    task_created = xTaskCreate(clock_task, "clock", 4096, NULL, 4, NULL);
     ESP_ERROR_CHECK(task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     task_created = xTaskCreate(boot_button_task, "boot_button", 3072, NULL, 5, NULL);
     ESP_ERROR_CHECK(task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
